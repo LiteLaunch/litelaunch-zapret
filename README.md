@@ -1,7 +1,7 @@
 # litelaunch-zapret
 
 Config picker for Flowseal's [zapret-discord-youtube](https://github.com/Flowseal/zapret-discord-youtube),
-a built-in plugin of [LiteLaunch](https://github.com/Slava-Gusak/litelaunch) (`z <name>`). It lives in the
+a built-in plugin of [LiteLaunch](https://github.com/LiteLaunch/litelaunch) (`z <name>`). It lives in the
 launcher as `plugins/zapret` and is native (no Python).
 
 ## Where zapret comes from
