@@ -5,13 +5,14 @@
 //!
 //! zapret itself is kept by the plugin in %APPDATA%\LiteLaunch\zapret\zapret-discord-youtube-<ver>
 //! (or in a folder the user picks) and is installed and updated from GitHub by update.ps1,
-//! which keeps the user's settings. Native, no Python.
+//! which keeps the user's settings. A LiteLaunch plugin (DLL), no Python.
 
-use crate::search::{Action, Item};
+use litelaunch_plugin::{After, Host, Info, Item, Plugin, Reply, export_plugin};
+use litelaunch_plugin::Action;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::*;
 use windows::Win32::System::Diagnostics::ToolHelp::*;
@@ -61,7 +62,7 @@ impl Default for ZapretConfig {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum Op {
     /// Config name: stop what runs, start `<name>.bat` elevated.
     Start(String),
@@ -80,8 +81,49 @@ pub enum Op {
     UseBuiltin,
 }
 
+/// The plugin's data folder, %APPDATA%\LiteLaunch\zapret (from the launcher, see `Plugin::init`).
+static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
+
 pub fn dir() -> PathBuf {
-    crate::config::dir().join("zapret")
+    DATA_DIR.get().cloned().unwrap_or_else(|| PathBuf::from(std::env::var("APPDATA").unwrap_or_default()).join("LiteLaunch").join("zapret"))
+}
+
+#[derive(Default)]
+pub struct Zapret;
+
+export_plugin!(Zapret);
+
+impl Plugin for Zapret {
+    type Settings = ZapretConfig;
+    type Op = Op;
+
+    fn info(&self, host: &Host) -> Info {
+        let _ = DATA_DIR.set(host.data_dir.clone());
+        Info {
+            name: "Zapret".into(),
+            description: "Запуск конфигов zapret-discord-youtube (Flowseal) в один Enter: избранное, остановка, установка и обновление с GitHub".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            icon: Some(icon()),
+            ..Default::default()
+        }
+    }
+
+    fn init(&self, host: &Host) {
+        let _ = DATA_DIR.set(host.data_dir.clone());
+        install();
+    }
+
+    fn query(&self, _host: &Host, cfg: &ZapretConfig, q: &str) -> Reply {
+        search(cfg, q).into()
+    }
+
+    fn actions(&self, _host: &Host, cfg: &ZapretConfig, item: &Item) -> Vec<Item> {
+        actions(cfg, item)
+    }
+
+    fn run(&self, _host: &Host, cfg: &mut ZapretConfig, op: Op) -> After {
+        run(&op, cfg)
+    }
 }
 
 pub fn icon() -> String {
@@ -89,14 +131,14 @@ pub fn icon() -> String {
 }
 
 pub fn install() {
-    crate::util::unpack(&dir(), FILES);
+    litelaunch_plugin::util::unpack(&dir(), FILES);
 }
 
 /// Where zapret lives: the configured folder or the plugin's own one.
 fn base(cfg: &ZapretConfig) -> PathBuf {
     match cfg.dir.trim() {
         "" => dir(),
-        d => PathBuf::from(crate::util::expand_env(d)),
+        d => PathBuf::from(litelaunch_plugin::util::expand_env(d)),
     }
 }
 
@@ -146,7 +188,7 @@ fn latest_version() -> Option<String> {
             use std::os::windows::process::CommandExt;
             let out = std::process::Command::new("curl.exe")
                 .args(["-s", "-f", "-m", "8", VERSION_URL])
-                .creation_flags(crate::util::CREATE_NO_WINDOW)
+                .creation_flags(litelaunch_plugin::util::CREATE_NO_WINDOW)
                 .output();
             let v = out.ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
             let v = v.filter(|v| !v.is_empty() && v.chars().all(|c| c.is_ascii_digit() || c == '.'));
@@ -328,18 +370,30 @@ fn service_running(name: windows::core::PCWSTR) -> bool {
 }
 
 /// A row with the icon of its kind (see make_icon.py); configs pick theirs in `search`.
-fn item(title: impl Into<String>, sub: impl Into<String>, score: i64, action: Action) -> Item {
-    let kind = match &action {
-        Action::Zapret(Op::Stop) => "stop",
-        Action::Zapret(Op::Update) => "update",
-        Action::Zapret(Op::Settings) => "settings",
-        Action::Zapret(Op::OpenFolder) => "folder",
-        Action::Zapret(Op::ChooseFolder | Op::UseBuiltin) => "folder-pick",
-        Action::Zapret(Op::ShowAll) => "list",
-        Action::Zapret(_) => "config",
-        _ => "warning",
+fn item(title: impl Into<String>, sub: impl Into<String>, score: i64, op: Option<Op>) -> Item {
+    let kind = match &op {
+        Some(Op::Stop) => "stop",
+        Some(Op::Update) => "update",
+        Some(Op::Settings) => "settings",
+        Some(Op::OpenFolder) => "folder",
+        Some(Op::ChooseFolder | Op::UseBuiltin) => "folder-pick",
+        Some(Op::ShowAll) => "list",
+        Some(_) => "config",
+        None => "warning",
     };
-    Item::new(title, sub, Some(icon_of(kind)), score, action)
+    let action = op.as_ref().map_or(Action::Nothing, Action::op);
+    let mut it = Item::new(title, sub, Some(icon_of(kind)), score, action);
+    // The folder dialog would open under the launcher window.
+    it.hide_first = matches!(op, Some(Op::ChooseFolder));
+    it
+}
+
+/// The op behind one of our rows.
+fn op_of(it: &Item) -> Option<Op> {
+    match &it.action {
+        Action::Plugin(v) => serde_json::from_value(v.clone()).ok(),
+        _ => None,
+    }
 }
 
 /// `icons/<kind>.png`, unpacked as `icon-<kind>.png`.
@@ -354,15 +408,15 @@ fn place(cfg: &ZapretConfig) -> String {
 }
 
 pub fn search(cfg: &ZapretConfig, q: &str) -> Vec<Item> {
-    let wants = |words: &[&str]| q.is_empty() || words.iter().any(|w| crate::fuzzy::score(w, q).is_some_and(|s| s >= 450));
+    let wants = |words: &[&str]| q.is_empty() || words.iter().any(|w| litelaunch_plugin::fuzzy::score(w, q).is_some_and(|s| s >= 450));
     // Rarely needed: at the very end, or found by typing "папка"/"встроенный".
     let source_rows = |items: &mut Vec<Item>| {
         if wants(&["выбрать папку", "папка", "folder"]) {
-            items.push(item("Выбрать папку zapret…", format!("Сейчас {}", place(cfg)), 0, Action::Zapret(Op::ChooseFolder)));
+            items.push(item("Выбрать папку zapret…", format!("Сейчас {}", place(cfg)), 0, Some(Op::ChooseFolder)));
         }
         if !cfg.dir.trim().is_empty() && wants(&["встроенный", "builtin", "папка"]) {
             let sub = format!("Свой zapret плагина в {}", dir().to_string_lossy());
-            items.push(item("Использовать встроенный zapret", sub, 0, Action::Zapret(Op::UseBuiltin)));
+            items.push(item("Использовать встроенный zapret", sub, 0, Some(Op::UseBuiltin)));
         }
     };
 
@@ -372,7 +426,7 @@ pub fn search(cfg: &ZapretConfig, q: &str) -> Vec<Item> {
             Some(other) => format!("Последняя версия с GitHub в {target}; настройки возьмутся из {}", other.to_string_lossy()),
             None => format!("Последняя версия с GitHub в {target}"),
         };
-        let mut items = vec![item("Установить zapret", sub, 0, Action::Zapret(Op::Update))];
+        let mut items = vec![item("Установить zapret", sub, 0, Some(Op::Update))];
         source_rows(&mut items);
         return items;
     };
@@ -397,7 +451,7 @@ pub fn search(cfg: &ZapretConfig, q: &str) -> Vec<Item> {
             }
             fav.map_or(if is_running { 1 } else { 0 }, |i| 10_000 - i as i64)
         } else {
-            let Some(s) = crate::fuzzy::score(&name, filter) else { continue };
+            let Some(s) = litelaunch_plugin::fuzzy::score(&name, filter) else { continue };
             s as i64 + if fav.is_some() { 200 } else { 0 }
         };
         let title = if fav.is_some() { format!("★ {name}") } else { name.clone() };
@@ -411,7 +465,7 @@ pub fn search(cfg: &ZapretConfig, q: &str) -> Vec<Item> {
             Some(n) => format!("⚠ Не запустится: команда {n} символов, предел cmd {CMD_LIMIT}. Сообщите автору плагина"),
             None => sub,
         };
-        let mut it = item(title, sub, score, Action::Zapret(Op::Start(name.clone())));
+        let mut it = item(title, sub, score, Some(Op::Start(name.clone())));
         let kind = match (is_running, fav.is_some(), too_long.is_some()) {
             (_, _, true) => "warning",
             (true, _, _) => "running",
@@ -425,7 +479,7 @@ pub fn search(cfg: &ZapretConfig, q: &str) -> Vec<Item> {
     items.sort_by(|a, b| b.score.cmp(&a.score));
     if all.is_some() {
         if items.is_empty() {
-            items.push(item("Нет такого конфига", format!("Конфиги — general*.bat в {}", root.to_string_lossy()), 0, Action::Nothing));
+            items.push(item("Нет такого конфига", format!("Конфиги — general*.bat в {}", root.to_string_lossy()), 0, None));
         }
         return items;
     }
@@ -433,15 +487,15 @@ pub fn search(cfg: &ZapretConfig, q: &str) -> Vec<Item> {
     // On: first row. Off: still there when asked for ("z стоп"), in case it runs unseen.
     let stop_words: &[&str] = &["остановить", "стоп", "выключить", "отключить", "stop"];
     match &running {
-        Some(r) if wants(stop_words) => items.insert(0, item("Остановить zapret", r.note.clone(), 0, Action::Zapret(Op::Stop))),
+        Some(r) if wants(stop_words) => items.insert(0, item("Остановить zapret", r.note.clone(), 0, Some(Op::Stop))),
         None if !q.is_empty() && wants(stop_words) => {
-            items.insert(0, item("Остановить zapret", "Похоже, не запущен; Enter всё равно остановит winws.exe, службу и WinDivert", 0, Action::Zapret(Op::Stop)))
+            items.insert(0, item("Остановить zapret", "Похоже, не запущен; Enter всё равно остановит winws.exe, службу и WinDivert", 0, Some(Op::Stop)))
         }
         _ => {}
     }
     // With no query they go right after the favorites, not below two dozen configs.
     let mut at = if q.is_empty() {
-        items.iter().take_while(|it| it.score > 0 || matches!(it.action, Action::Zapret(Op::Stop))).count()
+        items.iter().take_while(|it| it.score > 0 || matches!(op_of(it), Some(Op::Stop))).count()
     } else {
         items.len()
     };
@@ -454,14 +508,14 @@ pub fn search(cfg: &ZapretConfig, q: &str) -> Vec<Item> {
     let newer = latest.as_ref().filter(|l| natural_cmp(l, &local) == Ordering::Greater);
     if let Some(l) = newer {
         if wants(&["обновить", "update"]) {
-            put(&mut items, item(format!("Обновить zapret: {local} → {l}"), "Скачать с GitHub; списки и настройки сохранятся", 0, Action::Zapret(Op::Update)));
+            put(&mut items, item(format!("Обновить zapret: {local} → {l}"), "Скачать с GitHub; списки и настройки сохранятся", 0, Some(Op::Update)));
         }
     }
     if wants(&["настройки", "settings", "service"]) {
-        put(&mut items, item("Настройки zapret", "service.bat: служба, Game Filter, ipset, обновления, диагностика", 0, Action::Zapret(Op::Settings)));
+        put(&mut items, item("Настройки zapret", "service.bat: служба, Game Filter, ipset, обновления, диагностика", 0, Some(Op::Settings)));
     }
     if wants(&["папка", "folder", "открыть"]) {
-        put(&mut items, item("Открыть папку zapret", root.to_string_lossy().into_owned(), 0, Action::Zapret(Op::OpenFolder)));
+        put(&mut items, item("Открыть папку zapret", root.to_string_lossy().into_owned(), 0, Some(Op::OpenFolder)));
     }
     // No newer version: the update row only when asked for, saying what is installed.
     if newer.is_none() && !q.is_empty() && wants(&["обновить", "update"]) {
@@ -469,7 +523,7 @@ pub fn search(cfg: &ZapretConfig, q: &str) -> Vec<Item> {
             Some(l) => format!("Установлена {local}, последняя {l} · Enter — проверить ещё раз"),
             None => format!("Установлена {local} · Enter — проверить на GitHub"),
         };
-        items.push(item("Обновить zapret", sub, 0, Action::Zapret(Op::Update)));
+        items.push(item("Обновить zapret", sub, 0, Some(Op::Update)));
     }
     // Not in the plain `z ` (it would push "Конфиги" below the fold): `z папка` finds them.
     if !q.is_empty() {
@@ -477,59 +531,52 @@ pub fn search(cfg: &ZapretConfig, q: &str) -> Vec<Item> {
     }
     if q.is_empty() {
         let sub = format!("Все {} · Enter — показать, дальше можно печатать название", configs.len());
-        items.push(item("Конфиги", sub, 0, Action::Zapret(Op::ShowAll)));
+        items.push(item("Конфиги", sub, 0, Some(Op::ShowAll)));
     }
     if items.is_empty() {
-        items.push(item("Нет такого конфига", format!("Конфиги — general*.bat в {}", root.to_string_lossy()), 0, Action::Nothing));
+        items.push(item("Нет такого конфига", format!("Конфиги — general*.bat в {}", root.to_string_lossy()), 0, None));
     }
     items
 }
 
 /// Extra rows for a config's actions menu (Right arrow).
 pub fn actions(cfg: &ZapretConfig, item: &Item) -> Vec<Item> {
-    let Action::Zapret(Op::Start(name)) = &item.action else { return Vec::new() };
-    let fav = cfg.favorites.iter().any(|f| f.eq_ignore_ascii_case(name));
+    let Some(Op::Start(name)) = op_of(item) else { return Vec::new() };
+    let fav = cfg.favorites.iter().any(|f| f.eq_ignore_ascii_case(&name));
     let (glyph, title) = if fav { ('\u{E8D9}', "Убрать из избранного") } else { ('\u{E734}', "Добавить в избранное") };
-    let mut it = Item::new(title, name.clone(), None, 0, Action::Zapret(Op::ToggleFavorite(name.clone())));
+    let mut it = Item::new(title, name.clone(), None, 0, Action::op(&Op::ToggleFavorite(name.clone())));
     it.glyph = Some(glyph);
     vec![it]
-}
-
-/// What the window does after an op.
-pub enum After {
-    Hide,
-    Requery,
-    SetQuery(String),
 }
 
 /// `z конфиги`: the full list of configs.
 const ALL_WORD: &str = "конфиги";
 
-/// Runs an op; returns whether the config changed (save it) and what to do next.
-pub fn run(op: &Op, cfg: &mut ZapretConfig) -> (bool, After) {
+/// Runs an op; the launcher saves `cfg` if it changed.
+pub fn run(op: &Op, cfg: &mut ZapretConfig) -> After {
     match op {
         Op::Update => {
             update(cfg);
-            return (false, After::Hide);
+            return After::Hide;
         }
         Op::ChooseFolder => {
-            let Some(picked) = pick_folder(&base(cfg)) else { return (false, After::Hide) };
+            let Some(picked) = pick_folder(&base(cfg)) else { return After::Hide };
             // A versioned zapret folder: take the folder of versions, so updates go next to it.
             let use_dir = match picked.parent() {
                 Some(parent) if is_zapret(&picked) && name_of(&picked).to_lowercase().starts_with("zapret-discord-youtube-") => parent.to_path_buf(),
                 _ => picked,
             };
             cfg.dir = if use_dir == dir() { String::new() } else { use_dir.to_string_lossy().into_owned() };
-            return (true, After::Hide);
+            return After::Hide;
         }
         Op::UseBuiltin => {
             cfg.dir.clear();
-            return (true, After::Requery);
+            return After::Requery;
         }
-        Op::ShowAll => return (false, After::SetQuery(format!("{} {ALL_WORD} ", cfg.keyword))),
+        Op::ShowAll => return After::SetQuery(format!("{} {ALL_WORD} ", cfg.keyword)),
         _ => {}
     }
-    let Some(root) = root(cfg) else { return (false, After::Hide) };
+    let Some(root) = root(cfg) else { return After::Hide };
     // Stops a service-installed zapret too: it would fight the new winws.exe for WinDivert.
     // WinDivert goes too: a killed winws.exe leaves the driver loaded.
     const STOP: &str = "net stop zapret >nul 2>&1 & taskkill /F /IM winws.exe >nul 2>&1 & net stop WinDivert >nul 2>&1";
@@ -543,21 +590,21 @@ pub fn run(op: &Op, cfg: &mut ZapretConfig) -> (bool, After) {
             };
             elevated_cmd(&format!("{STOP} & call \"{}\"", run.to_string_lossy()), &root, SW_HIDE);
             cfg.last = name.clone();
-            (true, After::Hide)
+            After::Hide
         }
         Op::Stop => {
             elevated_cmd(STOP, &root, SW_HIDE);
-            (false, After::Hide)
+            After::Hide
         }
         Op::Settings => {
             // The "admin" argument skips service.bat's own (second) elevation request.
             let bat = root.join("service.bat");
             elevated_cmd(&format!("call \"{}\" admin", bat.to_string_lossy()), &root, SW_SHOWNORMAL);
-            (false, After::Hide)
+            After::Hide
         }
         Op::OpenFolder => {
             let _ = std::process::Command::new("explorer.exe").arg(&root).spawn();
-            (false, After::Hide)
+            After::Hide
         }
         Op::ToggleFavorite(name) => {
             match cfg.favorites.iter().position(|f| f.eq_ignore_ascii_case(name)) {
@@ -566,9 +613,9 @@ pub fn run(op: &Op, cfg: &mut ZapretConfig) -> (bool, After) {
                 }
                 None => cfg.favorites.push(name.clone()),
             }
-            (true, After::Requery)
+            After::Requery
         }
-        Op::Update | Op::ChooseFolder | Op::UseBuiltin | Op::ShowAll => (false, After::Hide),
+        Op::Update | Op::ChooseFolder | Op::UseBuiltin | Op::ShowAll => After::Hide,
     }
 }
 

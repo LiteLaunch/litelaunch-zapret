@@ -1,8 +1,8 @@
 # litelaunch-zapret
 
 Config picker for Flowseal's [zapret-discord-youtube](https://github.com/Flowseal/zapret-discord-youtube),
-a built-in plugin of [LiteLaunch](https://github.com/LiteLaunch/litelaunch) (`z <name>`). It lives in the
-launcher as `plugins/zapret` and is native (no Python).
+a plugin (DLL) of [LiteLaunch](https://github.com/LiteLaunch/litelaunch) (`z <name>`). It lives in the
+launcher's repository as the submodule `plugins/zapret` and is native (no Python).
 
 ## Where zapret comes from
 
@@ -85,3 +85,9 @@ as `icon-<kind>.png`:
 | folder (orange) | «Открыть папку zapret» |
 | folder-pick (teal) | choosing the folder, back to the built-in one |
 | list (violet) | «Конфиги» |
+
+## Build
+
+A `cdylib` against the launcher's SDK (`../../sdk`), so it is built inside the launcher's checkout:
+`powershell -File scripts\build-plugins.ps1` there gives `target\plugins\out\<id>\<id>.dll`; the launcher loads it
+from `%APPDATA%\LiteLaunch\plugins\<id>\`.
